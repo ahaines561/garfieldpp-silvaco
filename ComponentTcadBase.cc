@@ -1338,20 +1338,34 @@ bool ComponentTcadBase<N>::LoadSilvaco(const std::string& filename) {
   int colPot = -1, colEx = -1, colEy = -1;
   // Per-node {potential, Ex, Ey}, keyed by silvaco node id (0-based).
   std::map<std::size_t, std::array<double, 3>> nodeData;
+  std::map<std::size_t, unsigned int> lastBlock;
+  unsigned int iBlock = 0;
+  std::size_t nInterfaceNodes = 0;
+  std::size_t nNullDiscarded = 0;
+  std::size_t nConflicting = 0;
   // region_id -> material_code (from 'r' records).
   std::map<std::size_t, int> regionMaterial;
+  std::size_t nBadVertexLines = 0;
+  std::size_t nBadRegionLines = 0;
+  std::size_t nBadElementLines = 0;
+  std::size_t nBadNodeLines = 0;
 
   std::string line;
   while (std::getline(infile, line)) {
     if (line.empty()) continue;
     const char tag = line[0];
-    // vertex
+    // Coordinate (vertex) record: c id x y [z].
     if (tag == 'c' && line.size() > 1 && line[1] == ' ') {
       std::istringstream ss(line.substr(1));
       std::size_t cid;
-      double x, y, z = 0.;
-      ss >> cid >> x >> y >> z;
-      if (ss.fail()) continue;
+      double x, y;
+      // The z coordinate (always 0 in 2D files) is not used;
+      // tolerate its absence for 2D files.
+      ss >> cid >> x >> y;
+      if (ss.fail()) {
+        ++nBadVertexLines;
+        continue;
+      }
       std::array<double, N> v;
       v[0] = x * kUmToCm;
       v[1] = y * kUmToCm;
@@ -1365,7 +1379,11 @@ bool ComponentTcadBase<N>::LoadSilvaco(const std::string& filename) {
       std::size_t rid;
       int mat;
       ss >> rid >> mat;
-      if (!ss.fail()) regionMaterial[rid] = mat;
+      if (ss.fail()) {
+        ++nBadRegionLines;
+        continue;
+      }
+      regionMaterial[rid] = mat;
       continue;
     }
     // solution spec for t
@@ -1373,7 +1391,10 @@ bool ComponentTcadBase<N>::LoadSilvaco(const std::string& filename) {
       std::istringstream ss(line.substr(1));
       std::size_t tid, region, a, b, c;
       ss >> tid >> region >> a >> b >> c;
-      if (ss.fail()) continue;
+      if (ss.fail()) {
+        ++nBadElementLines;
+        continue;
+      }
       Element element;
       element.type = 2;
       element.region = region;
@@ -1384,12 +1405,13 @@ bool ComponentTcadBase<N>::LoadSilvaco(const std::string& filename) {
       m_elements.push_back(element);
       continue;
     }
-    // solution spec for s
     if (tag == 's' && line.size() > 1 && line[1] == ' ') {
       std::istringstream ss(line.substr(1));
       std::size_t ncode;
       ss >> ncode;
       codes.clear();
+      colPot = colEx = colEy = -1;
+      ++iBlock;
       for (std::size_t i = 0; i < ncode; ++i) {
         int code;
         ss >> code;
@@ -1405,19 +1427,44 @@ bool ComponentTcadBase<N>::LoadSilvaco(const std::string& filename) {
     if (tag == 'n' && line.size() > 1 && line[1] == ' ' && !codes.empty()) {
       std::istringstream ss(line.substr(1));
       std::size_t nid;
-      int fieldA;
-      ss >> nid >> fieldA;
-      if (ss.fail()) continue;
-      if (fieldA == 0) continue;
-      std::vector<double> vals;
-      vals.reserve(codes.size());
+      int flag;
+      ss >> nid >> flag;
+      if (ss.fail()) {
+        ++nBadNodeLines;
+        continue;
+      }
+      if (flag == 0) continue;
+      std::vector<double> tokens;
+      tokens.reserve(codes.size() + 1);
       double val;
-      while (ss >> val) vals.push_back(val);
-      if (vals.size() < codes.size()) continue;
+      while (ss >> val) tokens.push_back(val);
+      if (tokens.size() < codes.size()) {
+        ++nBadNodeLines;
+        continue;
+      }
+      const std::size_t offset = tokens.size() - codes.size();
       std::array<double, 3> d = {0., 0., 0.};
-      if (colPot >= 0) d[0] = vals[colPot];
-      if (colEx >= 0) d[1] = vals[colEx];
-      if (colEy >= 0) d[2] = vals[colEy];
+      if (colPot >= 0) d[0] = tokens[offset + colPot];
+      if (colEx >= 0) d[1] = tokens[offset + colEx];
+      if (colEy >= 0) d[2] = tokens[offset + colEy];
+      auto& lb = lastBlock[nid];
+      if (lb == iBlock) {
+        ++nInterfaceNodes;
+        const auto& stored = nodeData[nid];
+        unsigned int rankStored = 0, rankNew = 0;
+        for (unsigned int k = 0; k < 3; ++k) {
+          if (stored[k] != 0.) ++rankStored;
+          if (d[k] != 0.) ++rankNew;
+        }
+        if (rankNew < rankStored) {
+          ++nNullDiscarded;
+          continue;
+        }
+        if (rankStored > 0 && rankNew == rankStored) {
+          ++nConflicting;
+        }
+      }
+      lb = iBlock;
       nodeData[nid] = d;
       continue;
     }
@@ -1444,9 +1491,29 @@ bool ComponentTcadBase<N>::LoadSilvaco(const std::string& filename) {
   }
 
   // Size to the max region id
-  std::size_t nRegions = regionMaterial.size();
+  std::size_t minRegion = m_elements.front().region;
+  for (const auto& element : m_elements) {
+    minRegion = std::min(minRegion, element.region);
+  }
+  if (!regionMaterial.empty()) {
+    minRegion = std::min(minRegion, regionMaterial.begin()->first);
+  }
+  if (minRegion > 0) {
+    for (auto& element : m_elements) element.region -= minRegion;
+    std::map<std::size_t, int> shifted;
+    for (const auto& kv : regionMaterial) {
+      shifted[kv.first - minRegion] = kv.second;
+    }
+    regionMaterial.swap(shifted);
+  }
+
+  // size the region list to the largest region index in use
+  std::size_t nRegions = 0;
   for (const auto& element : m_elements) {
     nRegions = std::max(nRegions, element.region + 1);
+  }
+  if (!regionMaterial.empty()) {
+    nRegions = std::max(nRegions, regionMaterial.rbegin()->first + 1);
   }
   m_regions.resize(nRegions);
   for (std::size_t j = 0; j < nRegions; ++j) {
@@ -1464,11 +1531,18 @@ bool ComponentTcadBase<N>::LoadSilvaco(const std::string& filename) {
   m_efield.assign(nV, {});
   const bool haveField = (colEx >= 0 && colEy >= 0);
   const bool havePot = (colPot >= 0);
+  std::vector<unsigned int> fillCount(nV, 0);
+  std::size_t nOrphanNodes = 0;
   for (const auto& kv : nodeData) {
     const std::size_t nid = kv.first;
     const auto cit = coordIndex.find(nid + 1);
-    if (cit == coordIndex.end()) continue;
+    if (cit == coordIndex.end()) {
+      // Node id without a corresponding vertex.
+      ++nOrphanNodes;
+      continue;
+    }
     const std::size_t idx = cit->second;
+    ++fillCount[idx];
     if (havePot) m_epot[idx] = kv.second[0];
     if (haveField) {
       m_efield[idx][0] = kv.second[1];   // Ex
@@ -1477,6 +1551,46 @@ bool ComponentTcadBase<N>::LoadSilvaco(const std::string& filename) {
   }
   if (!haveField) m_efield.clear();
   if (!havePot) m_epot.clear();
+  if (!havePot && !haveField) {
+    std::cerr << m_className << "::LoadSilvaco:\n"
+              << "    Warning: no ElectrostaticPotential or ElectricField\n"
+              << "    quantity codes found; only the mesh was imported.\n";
+  }
+  // Consistency checks
+  if (havePot || haveField){
+    std::size_t nMissing = 0;
+    for (std::size_t i = 0; i < nV; ++i) {
+      if (fillCount[i] == 0) ++nMissing;
+    }
+    if (nMissing > 0) {
+      std::cerr << m_className << "::LoadSilvaco:\n"
+                << "    Warning: " << nMissing << " of " << nV
+                << " vertices received no nodal data\n"
+                << "    (potential/field left at zero).\n";
+    }
+    if (nInterfaceNodes > 0 && m_debug) {
+      // Not a warning: interface nodes with region-dependent records
+      // are expected in Silvaco output.
+      std::cout << m_className << "::LoadSilvaco:\n"
+                << "    " << nInterfaceNodes << " interface-node records ("
+                << nNullDiscarded << " less informative discarded, "
+                << nConflicting << " with data on both sides;\n"
+                << "    kept the most informative, then last, of each).\n";
+    }
+    if (nOrphanNodes > 0) {
+      std::cerr << m_className << "::LoadSilvaco:\n"
+                << "    Warning: " << nOrphanNodes
+                << " nodal records reference unknown vertices.\n";
+    }
+  }
+  if (nBadVertexLines + nBadRegionLines + nBadElementLines + nBadNodeLines >
+      0) {
+    std::cerr << m_className << "::LoadSilvaco:\n"
+              << "    Warning: skipped malformed records ("
+              << nBadVertexLines << " vertex, " << nBadRegionLines
+              << " region, " << nBadElementLines << " element, "
+              << nBadNodeLines << " nodal).\n";
+  }
 
   if (m_debug) {
     std::cout << m_className << "::LoadSilvaco:\n"
